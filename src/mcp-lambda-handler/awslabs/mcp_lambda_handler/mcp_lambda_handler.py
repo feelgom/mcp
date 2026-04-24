@@ -16,8 +16,12 @@ import functools
 import inspect
 import json
 import logging
-from awslabs.mcp_lambda_handler.session import DynamoDBSessionStore, NoOpSessionStore, SessionStore
-from awslabs.mcp_lambda_handler.types import (
+from awslabs.session import (
+    DynamoDBSessionStore,
+    NoOpSessionStore,
+    SessionStore,
+)
+from awslabs.types import (
     Capabilities,
     ErrorContent,
     ImageContent,
@@ -51,9 +55,11 @@ from typing import (
 logger = logging.getLogger(__name__)
 
 # Context variable to store current session ID
-current_session_id: ContextVar[Optional[str]] = ContextVar('current_session_id', default=None)
+current_session_id: ContextVar[Optional[str]] = ContextVar(
+    "current_session_id", default=None
+)
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 class SessionData(Generic[T]):
@@ -82,7 +88,7 @@ class MCPLambdaHandler:
     def __init__(
         self,
         name: str,
-        version: str = '1.0.0',
+        version: str = "1.0.0",
         session_store: Optional[Union[SessionStore, str]] = None,
     ):
         """Initialize the MCP handler.
@@ -159,25 +165,36 @@ class MCPLambdaHandler:
         # Save back to storage
         return self.set_session(session.raw())
 
-    def tool(self):
+    def tool(
+        self,
+        title: Optional[str] = None,
+        annotations: Optional[Dict[str, Any]] = None,
+    ):
         """Create a decorator for a function as an MCP tool.
 
         Uses function name, docstring, and type hints to generate the MCP tool schema.
+
+        Args:
+            title: Human-readable title for the tool (defaults to tool name)
+            annotations: Tool annotations (e.g. {"readOnlyHint": True})
         """
 
         def decorator(func: Callable):
-            # Get function name and preserve original snake_case naming
+            # Get function name and convert to camelCase for tool name
             func_name = func.__name__
-            tool_name = func_name
+            tool_name = "".join(
+                [func_name.split("_")[0]]
+                + [word.capitalize() for word in func_name.split("_")[1:]]
+            )
 
             # Get docstring and parse into description
-            doc = inspect.getdoc(func) or ''
-            description = doc.split('\n\n')[0]  # First paragraph is description
+            doc = inspect.getdoc(func) or ""
+            description = doc.split("\n\n")[0]  # First paragraph is description
 
             # Get type hints
             hints = get_type_hints(func)
             # return_type = hints.pop('return', Any)
-            hints.pop('return', Any)
+            hints.pop("return", Any)
 
             # Build input schema from type hints and docstring
             properties = {}
@@ -186,89 +203,87 @@ class MCPLambdaHandler:
             # Parse docstring for argument descriptions
             arg_descriptions = {}
             if doc:
-                lines = doc.split('\n')
+                lines = doc.split("\n")
                 in_args = False
                 for line in lines:
-                    if line.strip().startswith('Args:'):
+                    if line.strip().startswith("Args:"):
                         in_args = True
                         continue
                     if in_args:
-                        if not line.strip() or line.strip().startswith('Returns:'):
+                        if not line.strip() or line.strip().startswith("Returns:"):
                             break
-                        if ':' in line:
-                            arg_name, arg_desc = line.split(':', 1)
+                        if ":" in line:
+                            arg_name, arg_desc = line.split(":", 1)
                             arg_descriptions[arg_name.strip()] = arg_desc.strip()
 
             def get_type_schema(type_hint: Any) -> Dict[str, Any]:
                 # Handle basic types
                 if type_hint is int:
-                    return {'type': 'integer'}
+                    return {"type": "integer"}
                 elif type_hint is float:
-                    return {'type': 'number'}
+                    return {"type": "number"}
                 elif type_hint is bool:
-                    return {'type': 'boolean'}
+                    return {"type": "boolean"}
                 elif type_hint is str:
-                    return {'type': 'string'}
+                    return {"type": "string"}
 
                 # Handle Enums
                 if isinstance(type_hint, type) and issubclass(type_hint, Enum):
-                    return {'type': 'string', 'enum': [e.value for e in type_hint]}
+                    return {"type": "string", "enum": [e.value for e in type_hint]}
 
                 # Get origin type (e.g., Dict from Dict[str, int])
                 origin = get_origin(type_hint)
-
-                # Handle Union types (including Optional[T] which is Union[T, None])
-                if origin is Union:
-                    args = get_args(type_hint)
-                    non_none_args = [arg for arg in args if arg is not type(None)]
-                    if len(non_none_args) == 1:
-                        return get_type_schema(non_none_args[0])
-                    # For Union with multiple non-None types, use first type
-                    return (
-                        get_type_schema(non_none_args[0]) if non_none_args else {'type': 'string'}
-                    )
-
                 if origin is None:
-                    return {'type': 'string'}  # Default for unknown types
+                    return {"type": "string"}  # Default for unknown types
 
                 # Handle Dict types
                 if origin is dict or origin is Dict:
                     args = get_args(type_hint)
                     if not args:
-                        return {'type': 'object', 'additionalProperties': True}
+                        return {"type": "object", "additionalProperties": True}
 
                     # Get value type schema (args[1] is value type)
                     value_schema = get_type_schema(args[1])
-                    return {'type': 'object', 'additionalProperties': value_schema}
+                    return {"type": "object", "additionalProperties": value_schema}
 
                 # Handle List types
                 if origin is list or origin is List:
                     args = get_args(type_hint)
                     if not args:
-                        return {'type': 'array', 'items': {}}
+                        return {"type": "array", "items": {}}
 
                     item_schema = get_type_schema(args[0])
-                    return {'type': 'array', 'items': item_schema}
+                    return {"type": "array", "items": item_schema}
 
                 # Default for unknown complex types
-                return {'type': 'string'}
+                return {"type": "string"}
 
-            # Build properties from type hints
+            # Build properties from type hints, only mark params without
+            # defaults as required
+            sig = inspect.signature(func)
             for param_name, param_type in hints.items():
                 param_schema = get_type_schema(param_type)
 
                 if param_name in arg_descriptions:
-                    param_schema['description'] = arg_descriptions[param_name]
+                    param_schema["description"] = arg_descriptions[param_name]
 
                 properties[param_name] = param_schema
-                required.append(param_name)
+                if sig.parameters[param_name].default is inspect.Parameter.empty:
+                    required.append(param_name)
 
             # Create tool schema
             tool_schema = {
-                'name': tool_name,
-                'description': description,
-                'inputSchema': {'type': 'object', 'properties': properties, 'required': required},
+                "name": tool_name,
+                "title": title or tool_name,
+                "description": description,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
             }
+            if annotations:
+                tool_schema["annotations"] = annotations
 
             # Register the tool
             self.tools[tool_name] = tool_schema
@@ -306,9 +321,9 @@ class MCPLambdaHandler:
             resource = StaticResource(
                 uri=uri,
                 name=name,
-                content='',  # Will be populated by function call
+                content="",  # Will be populated by function call
                 description=description,
-                mime_type=mime_type or 'text/plain',
+                mime_type=mime_type or "text/plain",
             )
             # Store the function to call when resource is accessed
             resource._content_func = func
@@ -329,17 +344,17 @@ class MCPLambdaHandler:
         """Create a standardized error response."""
         error = JSONRPCError(code=code, message=message)
         response = JSONRPCResponse(
-            jsonrpc='2.0', id=request_id, error=error, errorContent=error_content
+            jsonrpc="2.0", id=request_id, error=error, errorContent=error_content
         )
 
-        headers = {'Content-Type': 'application/json', 'MCP-Version': '0.6'}
+        headers = {"Content-Type": "application/json", "MCP-Version": "0.6"}
         if session_id:
-            headers['MCP-Session-Id'] = session_id
+            headers["MCP-Session-Id"] = session_id
 
         return {
-            'statusCode': status_code or self._error_code_to_http_status(code),
-            'body': response.model_dump_json(),
-            'headers': headers,
+            "statusCode": status_code or self._error_code_to_http_status(code),
+            "body": response.model_dump_json(),
+            "headers": headers,
         }
 
     def _error_code_to_http_status(self, error_code: int) -> int:
@@ -362,25 +377,31 @@ class MCPLambdaHandler:
         Returns:
             A list of content objects as dictionaries
         """
+        # Handle list of content objects (already formatted for MCP)
+        if isinstance(result, list):
+            # Check if it's a list of MCP content objects
+            if result and isinstance(result[0], dict) and "type" in result[0]:
+                return result
+
         if isinstance(result, bytes):
             # Handle byte stream (likely an image)
             import base64
 
             # Try to determine MIME type from the first few bytes
-            mime_type = 'application/octet-stream'  # Default MIME type
+            mime_type = "application/octet-stream"  # Default MIME type
 
             # Check for common image signatures
-            if result.startswith(b'\xff\xd8\xff'):  # JPEG
-                mime_type = 'image/jpeg'
-            elif result.startswith(b'\x89PNG\r\n\x1a\n'):  # PNG
-                mime_type = 'image/png'
-            elif result.startswith(b'GIF87a') or result.startswith(b'GIF89a'):  # GIF
-                mime_type = 'image/gif'
-            elif result.startswith(b'RIFF') and result[8:12] == b'WEBP':  # WebP
-                mime_type = 'image/webp'
+            if result.startswith(b"\xff\xd8\xff"):  # JPEG
+                mime_type = "image/jpeg"
+            elif result.startswith(b"\x89PNG\r\n\x1a\n"):  # PNG
+                mime_type = "image/png"
+            elif result.startswith(b"GIF87a") or result.startswith(b"GIF89a"):  # GIF
+                mime_type = "image/gif"
+            elif result.startswith(b"RIFF") and result[8:12] == b"WEBP":  # WebP
+                mime_type = "image/webp"
 
             # Convert bytes to base64 string
-            base64_data = base64.b64encode(result).decode('utf-8')
+            base64_data = base64.b64encode(result).decode("utf-8")
             return [ImageContent(data=base64_data, mimeType=mime_type).model_dump()]
         else:
             # Default to text content for other result types
@@ -390,13 +411,17 @@ class MCPLambdaHandler:
         self, result: Any, request_id: str | None, session_id: Optional[str] = None
     ) -> Dict:
         """Create a standardized success response."""
-        response = JSONRPCResponse(jsonrpc='2.0', id=request_id, result=result)
+        response = JSONRPCResponse(jsonrpc="2.0", id=request_id, result=result)
 
-        headers = {'Content-Type': 'application/json', 'MCP-Version': '0.6'}
+        headers = {"Content-Type": "application/json", "MCP-Version": "0.6"}
         if session_id:
-            headers['MCP-Session-Id'] = session_id
+            headers["MCP-Session-Id"] = session_id
 
-        return {'statusCode': 200, 'body': response.model_dump_json(), 'headers': headers}
+        return {
+            "statusCode": 200,
+            "body": response.model_dump_json(),
+            "headers": headers,
+        }
 
     def handle_request(self, event: Dict, context: Any) -> Dict:
         """Handle an incoming Lambda request."""
@@ -405,13 +430,13 @@ class MCPLambdaHandler:
 
         try:
             # Log the full event for debugging
-            logger.debug(f'Received event: {event}')
+            logger.debug(f"Received event: {event}")
 
             # Get headers (case-insensitive)
-            headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
+            headers = {k.lower(): v for k, v in event.get("headers", {}).items()}
 
             # Get session ID from headers if present
-            session_id = headers.get('mcp-session-id')
+            session_id = headers.get("mcp-session-id")
 
             # Set current session ID in context
             if session_id:
@@ -420,89 +445,103 @@ class MCPLambdaHandler:
                 current_session_id.set(None)
 
             # Check HTTP method for session deletion
-            if event.get('httpMethod') == 'DELETE' and session_id:
+            if event.get("httpMethod") == "DELETE" and session_id:
                 if self.session_store.delete_session(session_id):
-                    return {'statusCode': 204}
+                    return {"statusCode": 204}
                 else:
-                    return {'statusCode': 404}
+                    return {"statusCode": 404}
 
             # Validate content type
-            if headers.get('content-type') != 'application/json':
-                return self._create_error_response(-32700, 'Unsupported Media Type')
+            if headers.get("content-type") != "application/json":
+                return self._create_error_response(-32700, "Unsupported Media Type")
 
             try:
-                body = json.loads(event['body'])
-                logger.debug(f'Parsed request body: {body}')
-                request_id = body.get('id') if isinstance(body, dict) else None
+                body = json.loads(event["body"])
+                logger.debug(f"Parsed request body: {body}")
+                request_id = body.get("id") if isinstance(body, dict) else None
 
                 # Check if this is a notification (no id field)
-                if isinstance(body, dict) and 'id' not in body:
-                    logger.debug('Request is a notification')
+                if isinstance(body, dict) and "id" not in body:
+                    logger.debug("Request is a notification")
                     return {
-                        'statusCode': 202,
-                        'body': '',
-                        'headers': {'Content-Type': 'application/json', 'MCP-Version': '0.6'},
+                        "statusCode": 202,
+                        "body": "",
+                        "headers": {
+                            "Content-Type": "application/json",
+                            "MCP-Version": "0.6",
+                        },
                     }
 
                 # Validate basic JSON-RPC structure
                 if (
                     not isinstance(body, dict)
-                    or body.get('jsonrpc') != '2.0'
-                    or 'method' not in body
+                    or body.get("jsonrpc") != "2.0"
+                    or "method" not in body
                 ):
-                    return self._create_error_response(-32700, 'Parse error', request_id)
+                    return self._create_error_response(
+                        -32700, "Parse error", request_id
+                    )
 
             except json.JSONDecodeError:
-                return self._create_error_response(-32700, 'Parse error')
+                return self._create_error_response(-32700, "Parse error")
 
             # Parse and validate the request
             request = JSONRPCRequest.model_validate(body)
-            logger.debug(f'Validated request: {request}')
+            logger.debug(f"Validated request: {request}")
 
             # Handle initialization request
-            if request.method == 'initialize':
-                logger.info('Handling initialize request')
+            if request.method == "initialize":
+                logger.info("Handling initialize request")
                 # Create new session
                 session_id = self.session_store.create_session()
                 current_session_id.set(session_id)
                 result = InitializeResult(
-                    protocolVersion='2024-11-05',
+                    protocolVersion="2024-11-05",
                     serverInfo=ServerInfo(name=self.name, version=self.version),
                     capabilities=Capabilities(
-                        tools={'list': True, 'call': True}, resources={'list': True, 'read': True}
+                        tools={"list": True, "call": True},
+                        resources={"list": True, "read": True},
                     ),
                 )
-                return self._create_success_response(result.model_dump(), request.id, session_id)
+                return self._create_success_response(
+                    result.model_dump(), request.id, session_id
+                )
 
             # For all other requests, validate session if provided
             if session_id:
                 session_data = self.session_store.get_session(session_id)
                 if session_data is None:
                     return self._create_error_response(
-                        -32000, 'Invalid or expired session', request.id, status_code=404
+                        -32000,
+                        "Invalid or expired session",
+                        request.id,
+                        status_code=404,
                     )
-            elif request.method != 'initialize' and not isinstance(
+            elif request.method != "initialize" and not isinstance(
                 self.session_store, NoOpSessionStore
             ):
                 return self._create_error_response(
-                    -32000, 'Session required', request.id, status_code=400
+                    -32000, "Session required", request.id, status_code=400
                 )
 
             # Handle tools/list request
-            if request.method == 'tools/list':
-                logger.info('Handling tools/list request')
+            if request.method == "tools/list":
+                logger.info("Handling tools/list request")
                 return self._create_success_response(
-                    {'tools': list(self.tools.values())}, request.id, session_id
+                    {"tools": list(self.tools.values())}, request.id, session_id
                 )
 
             # Handle tool calls
-            if request.method == 'tools/call' and request.params:
-                tool_name = request.params.get('name')
-                tool_args = request.params.get('arguments', {})
+            if request.method == "tools/call" and request.params:
+                tool_name = request.params.get("name")
+                tool_args = request.params.get("arguments", {})
 
                 if tool_name not in self.tools:
                     return self._create_error_response(
-                        -32601, f"Tool '{tool_name}' not found", request.id, session_id=session_id
+                        -32601,
+                        f"Tool '{tool_name}' not found",
+                        request.id,
+                        session_id=session_id,
                     )
 
                 try:
@@ -521,40 +560,42 @@ class MCPLambdaHandler:
                     result = tool_func(**converted_args)
                     content = self._convert_result_to_content(result)
                     return self._create_success_response(
-                        {'content': content}, request.id, session_id
+                        {"content": content}, request.id, session_id
                     )
                 except Exception as e:
-                    logger.error(f'Error executing tool {tool_name}: {e}')
+                    logger.error(f"Error executing tool {tool_name}: {e}")
                     error_content = [ErrorContent(text=str(e)).model_dump()]
                     return self._create_error_response(
                         -32603,
-                        f'Error executing tool: {str(e)}',
+                        f"Error executing tool: {str(e)}",
                         request.id,
                         error_content,
                         session_id,
                     )
             # Handle resources/list request
-            if request.method == 'resources/list':
-                logger.info('Handling resources/list request')
-                resources_list = [resource.model_dump() for resource in self.resources.values()]
+            if request.method == "resources/list":
+                logger.info("Handling resources/list request")
+                resources_list = [
+                    resource.model_dump() for resource in self.resources.values()
+                ]
                 return self._create_success_response(
-                    {'resources': resources_list}, request.id, session_id
+                    {"resources": resources_list}, request.id, session_id
                 )
 
             # Handle resources/read request
-            if request.method == 'resources/read':
+            if request.method == "resources/read":
                 if not request.params:
                     return self._create_error_response(
                         -32602,
-                        'Missing required parameter: uri',
+                        "Missing required parameter: uri",
                         request.id,
                         session_id=session_id,
                     )
-                resource_uri = request.params.get('uri')
+                resource_uri = request.params.get("uri")
                 if not resource_uri:
                     return self._create_error_response(
                         -32602,
-                        'Missing required parameter: uri',
+                        "Missing required parameter: uri",
                         request.id,
                         session_id=session_id,
                     )
@@ -562,7 +603,7 @@ class MCPLambdaHandler:
                 if resource_uri not in self.resources:
                     return self._create_error_response(
                         -32601,
-                        f'Resource not found: {resource_uri}',
+                        f"Resource not found: {resource_uri}",
                         request.id,
                         session_id=session_id,
                     )
@@ -571,41 +612,53 @@ class MCPLambdaHandler:
                     resource = self.resources[resource_uri]
 
                     # Handle content resources that requires function calls
-                    if hasattr(resource, '_content_func') and resource._content_func is not None:
+                    if (
+                        hasattr(resource, "_content_func")
+                        and resource._content_func is not None
+                    ):
                         content = resource._content_func()
                         resource_content = ResourceContent(
-                            uri=resource_uri, mimeType=resource.mimeType, text=str(content)
+                            uri=resource_uri,
+                            mimeType=resource.mimeType,
+                            text=str(content),
                         )
                     else:
                         # Handle static resources (like FileResource)
                         resource_content = resource.read_content()
 
                     return self._create_success_response(
-                        {'contents': [resource_content.model_dump()]}, request.id, session_id
+                        {"contents": [resource_content.model_dump()]},
+                        request.id,
+                        session_id,
                     )
                 except Exception as e:
-                    logger.error(f'Error reading resource {resource_uri}: {e}')
+                    logger.error(f"Error reading resource {resource_uri}: {e}")
                     error_content = [ErrorContent(text=str(e)).model_dump()]
                     return self._create_error_response(
                         -32603,
-                        f'Error reading resource: {str(e)}',
+                        f"Error reading resource: {str(e)}",
                         request.id,
                         error_content,
                         session_id,
                     )
 
             # Handle pings
-            if request.method == 'ping':
+            if request.method == "ping":
                 return self._create_success_response({}, request.id, session_id)
 
             # Handle unknown methods
             return self._create_error_response(
-                -32601, f'Method not found: {request.method}', request.id, session_id=session_id
+                -32601,
+                f"Method not found: {request.method}",
+                request.id,
+                session_id=session_id,
             )
 
         except Exception as e:
-            logger.error(f'Error processing request: {str(e)}', exc_info=True)
-            return self._create_error_response(-32000, str(e), request_id, session_id=session_id)
+            logger.error(f"Error processing request: {str(e)}", exc_info=True)
+            return self._create_error_response(
+                -32000, str(e), request_id, session_id=session_id
+            )
         finally:
             # Clear session context
             current_session_id.set(None)
